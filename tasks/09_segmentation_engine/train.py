@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from dataset import ParcelSegDataset
 from model import build_model
 from losses import MultiLabelSegLoss
-from metrics import per_channel_iou
+from metrics import iou_counts, iou_from_counts
 
 
 def set_seed(seed):
@@ -32,7 +32,8 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None, class_names=None):
     model.train() if is_train else model.eval()
 
     total_loss = 0.0
-    iou_accum = torch.zeros(len(class_names))
+    inter_accum = torch.zeros(len(class_names))
+    union_accum = torch.zeros(len(class_names))
     n_batches = 0
 
     context = torch.enable_grad() if is_train else torch.no_grad()
@@ -50,12 +51,15 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None, class_names=None):
                 optimizer.step()
 
             total_loss += loss.item()
-            iou_accum += per_channel_iou(logits, masks).cpu()
+            inter, union = iou_counts(logits, masks)
+            inter_accum += inter.cpu()
+            union_accum += union.cpu()
             n_batches += 1
 
     avg_loss = total_loss / max(n_batches, 1)
-    avg_iou = iou_accum / max(n_batches, 1)
-    return avg_loss, avg_iou
+    # Dataset-level IoU; channels absent from the whole split come back NaN.
+    epoch_iou = iou_from_counts(inter_accum, union_accum)
+    return avg_loss, epoch_iou
 
 
 def main(config_path):
@@ -126,14 +130,19 @@ def main(config_path):
         )
         scheduler.step()
 
-        mean_val_iou = val_iou.mean().item()
+        # nanmean so channels absent from the val split (NaN) don't drag the
+        # mean — they are excluded, not counted as 1.0.
+        mean_val_iou = torch.nanmean(val_iou).item()
 
         print(f"\nEpoch {epoch+1}/{cfg['train']['epochs']}")
         print(f"  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
         for name, iou_val in zip(class_names, val_iou.tolist()):
-            print(f"  val_iou[{name}] = {iou_val:.4f}")
-        print(f"  val_iou[mean] = {mean_val_iou:.4f}  (reported per-class above too — "
-              f"do not rely on mean alone, see TASK_09)")
+            if iou_val != iou_val:  # NaN -> class not present in this split
+                print(f"  val_iou[{name}] = n/a (absent from val split)")
+            else:
+                print(f"  val_iou[{name}] = {iou_val:.4f}")
+        print(f"  val_iou[mean] = {mean_val_iou:.4f}  (over present classes; "
+              f"reported per-class above too — do not rely on mean alone, see TASK_09)")
 
         if mean_val_iou > best_metric:
             best_metric = mean_val_iou
