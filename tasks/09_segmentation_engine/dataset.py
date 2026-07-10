@@ -74,10 +74,11 @@ class ParcelSegDataset(Dataset):
     def _build_transform(self):
         if A is None:
             return None
+        # NOTE: flips + 90° rotations (the dihedral-8 group) are materialized
+        # OFFLINE when the dataset is built, so they are intentionally NOT
+        # repeated here — doing both would just re-shuffle the same 8 finite
+        # orientations. Only non-dihedral transforms run online.
         return A.Compose([
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.RandomRotate90(p=1.0),
             A.ElasticTransform(alpha=30, sigma=5, p=0.2),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.2),
         ])

@@ -20,9 +20,12 @@ model:
 loss:
   bce_weight: 1.0
   dice_weight: 1.0
-  # inverse-frequency pos_weight per channel for BCE, recompute once real
-  # data is loaded — these are placeholders, NOT to be trusted as-is
-  pos_weight: [2.0, 3.0, 2.5, 1.5]
+  # inverse-frequency pos_weight per channel for BCE (neg/pos), computed from
+  # the 26 train base tiles of the fold-1 trial set (downscaled 512px):
+  #   parcel_border 1.83% px -> 53.665   building     11.03% px -> 8.066
+  #   hard_surface  4.15% px -> 23.079   tree          3.03% px -> 32.022
+  # Recompute if the dataset changes.
+  pos_weight: [53.665, 8.066, 23.079, 32.022]
 
 train:
   batch_size: 8
@@ -36,9 +39,13 @@ train:
   device: "cuda"
 
 augmentation:
-  hflip: 0.5
-  vflip: 0.5
-  rotate90: true          # safe for aerial imagery, no canonical "up"
+  # Dihedral-8 (flips + 90° rotations) is applied OFFLINE when building the
+  # dataset (each train tile is materialized in all 8 orientations), so the
+  # online geometric transforms below are disabled to avoid stacking. Only
+  # the non-dihedral photometric/elastic transforms run online.
+  hflip: 0.0
+  vflip: 0.0
+  rotate90: false
   elastic_deform: 0.2      # apply to image+mask jointly
   color_jitter: 0.2
 
