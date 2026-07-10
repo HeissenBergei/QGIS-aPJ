@@ -1,0 +1,47 @@
+seed: 42
+
+data:
+  root: "data"
+  image_dir: "images"
+  mask_dir: "masks"
+  train_split: "splits/train.txt"
+  val_split: "splits/val.txt"
+  tile_size: 512
+  num_classes: 4
+  class_names: ["parcel_border", "building", "hard_surface", "tree"]
+
+model:
+  arch: "Unet"          # smp.Unet | smp.UnetPlusPlus (fallback for tree channel)
+  encoder: "resnet34"
+  encoder_weights: "imagenet"
+  in_channels: 3
+  classes: 4
+
+loss:
+  bce_weight: 1.0
+  dice_weight: 1.0
+  # inverse-frequency pos_weight per channel for BCE, recompute once real
+  # data is loaded — these are placeholders, NOT to be trusted as-is
+  pos_weight: [2.0, 3.0, 2.5, 1.5]
+
+train:
+  batch_size: 8
+  epochs: 60
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"
+  scheduler: "cosine"
+  early_stopping_patience: 10
+  num_workers: 2
+  device: "cuda"
+
+augmentation:
+  hflip: 0.5
+  vflip: 0.5
+  rotate90: true          # safe for aerial imagery, no canonical "up"
+  elastic_deform: 0.2      # apply to image+mask jointly
+  color_jitter: 0.2
+
+checkpoint:
+  dir: "checkpoints"
+  save_best_metric: "mean_iou"
