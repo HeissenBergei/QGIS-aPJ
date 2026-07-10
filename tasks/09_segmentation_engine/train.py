@@ -101,7 +101,7 @@ def main(config_path):
         pos_weight=cfg["loss"]["pos_weight"],
         bce_weight=cfg["loss"]["bce_weight"],
         dice_weight=cfg["loss"]["dice_weight"],
-    )
+    ).to(device)  # moves the pos_weight buffer onto the training device
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg["train"]["lr"],
         weight_decay=cfg["train"]["weight_decay"],

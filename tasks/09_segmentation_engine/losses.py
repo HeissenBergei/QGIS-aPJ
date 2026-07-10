@@ -21,7 +21,11 @@ def dice_loss_per_channel(logits, targets, eps=1e-6):
 class MultiLabelSegLoss(nn.Module):
     def __init__(self, pos_weight=None, bce_weight=1.0, dice_weight=1.0):
         super().__init__()
-        pw = torch.tensor(pos_weight, dtype=torch.float32) if pos_weight else None
+        # pos_weight must broadcast over the CHANNEL dim of (B, C, H, W).
+        # A flat (C,) tensor would align with the last axis (W) and fail;
+        # reshape to (C, 1, 1) so it broadcasts per channel.
+        pw = (torch.tensor(pos_weight, dtype=torch.float32).view(-1, 1, 1)
+              if pos_weight else None)
         self.bce = nn.BCEWithLogitsLoss(pos_weight=pw, reduction="none")
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
