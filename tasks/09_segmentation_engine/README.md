@@ -17,14 +17,19 @@ the existing Task 01–07 structure, and point Claude Code at
 - `train.py` — training loop, entry point.
 - `colab_trial.ipynb` — smoke-test notebook for the small mirrored dataset.
 
-## First thing to actually verify before training
-The data contract in `TASK_09_segmentation_engine.md` assumes 4-band
-GeoTIFF masks. This has NOT been confirmed against the addon's actual
-export format. Before running the Colab trial:
-1. Export one sample tile + mask from the addon
-2. Run the sanity-check cell in `colab_trial.ipynb`
-3. If band count/order doesn't match, fix `dataset.py::_load_mask()` — this
-   is the only place format assumptions live
+## Data contract (confirmed against the addon export)
+The contract has been reconciled with the Zoning Manager addon
+(`zoning_manager/export/rasterize.py`). Images = the addon's
+`<stem>_satellite.png` (RGB); masks = `<stem>_mask_index.png`, a
+**single-channel multi-class index map** (NOT a 4-band stack).
+`dataset.py::_load_mask()` expands that index map into the four binary
+channels (parcel_border ring, building, hard_surface, tree←`hard_landscape`)
+via the `ADDON_INDEX` mapping — the only place format assumptions live.
+Before running the Colab trial:
+1. Export one sample tile from the addon (`_satellite.png` + `_mask_index.png`)
+2. Run the sanity-check cell in `colab_trial.ipynb` — it prints the index
+   map's unique class values so you can confirm they match `ADDON_INDEX`
+3. If the index values differ, adjust `ADDON_INDEX` in `dataset.py`
 
 ## Suggested Claude Code workflow
 Given the existing git worktree pattern:

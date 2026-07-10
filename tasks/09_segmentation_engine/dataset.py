@@ -1,14 +1,25 @@
 """
 Dataset loader for the fold-1 autonomous segmentation engine.
 
-Assumed data contract (see TASK_09_segmentation_engine.md):
-  data/images/<id>.tif  -> 3-band RGB uint8
-  data/masks/<id>.tif   -> 4-band uint8 {0,1}, band order:
-                           [parcel_border, building, hard_surface, tree]
+Data contract (confirmed against the Zoning Manager addon export,
+zoning_manager/export/rasterize.py; see TASK_09_segmentation_engine.md):
 
-If the addon export format differs (e.g. GeoPackage vector layers instead
-of pre-rasterized masks), add a rasterize() step in _load_mask() and leave
-everything else unchanged.
+  data/images/<id>.png  -> the addon's "<stem>_satellite.png" (RGB, uint8)
+  data/masks/<id>.png   -> the addon's "<stem>_mask_index.png"
+                           (single-channel Grayscale8 class-index map)
+
+The addon writes a MULTI-CLASS index map (one integer class per pixel), NOT a
+4-band multi-label stack. We expand it here into the four independent binary
+channels Task 09 trains on, by matching each channel to its addon class index
+(ADDON_INDEX below). Classes barely overlap (a thin parcel-border ring + three
+mutually-exclusive fills), so this expansion is effectively lossless.
+
+Addon index values (from rasterize.py mask_class_index(); 0 = background):
+  1 soft_landscape  2 hard_landscape  3 hard_surface   4 parking_space
+  5 building        6 parcel_border   7 main_entrance  8 building_entrance
+
+Only the four channels below are used; every other index (soft_landscape,
+parking_space, entrances) collapses to background for this task.
 """
 
 import os
@@ -25,6 +36,18 @@ except ImportError:
     A = None
 
 
+# Task 09 channel name -> integer value in the addon's _mask_index.png.
+# parcel_border is the thin WALL RING (not the filled interior); tree is the
+# addon's "hard_landscape". parking_space (4) is intentionally excluded (a
+# future feature), so it is treated as background.
+ADDON_INDEX = {
+    "parcel_border": 6,
+    "building": 5,
+    "hard_surface": 3,
+    "tree": 2,
+}
+
+
 class ParcelSegDataset(Dataset):
     def __init__(self, root, split_file, image_dir="images", mask_dir="masks",
                  tile_size=512, augment=False, class_names=None):
@@ -36,6 +59,11 @@ class ParcelSegDataset(Dataset):
         self.class_names = class_names or [
             "parcel_border", "building", "hard_surface", "tree"
         ]
+        missing = [c for c in self.class_names if c not in ADDON_INDEX]
+        assert not missing, (
+            f"No addon _mask_index.png class index mapped for {missing}. "
+            f"Known: {sorted(ADDON_INDEX)}."
+        )
 
         split_path = self.root / split_file
         with open(split_path) as f:
@@ -58,22 +86,23 @@ class ParcelSegDataset(Dataset):
         return len(self.ids)
 
     def _load_image(self, tile_id):
-        path = self.image_dir / f"{tile_id}.tif"
+        path = self.image_dir / f"{tile_id}.png"
         with rasterio.open(path) as src:
-            img = src.read()  # (C, H, W)
+            img = src.read()  # (C, H, W); RGBA if the satellite PNG has alpha
+        img = img[:3]  # drop the (opaque) alpha channel if present
         img = np.transpose(img, (1, 2, 0)).astype(np.float32) / 255.0
         return img
 
     def _load_mask(self, tile_id):
-        path = self.mask_dir / f"{tile_id}.tif"
+        """Read the addon's single-channel class-index PNG and expand it into
+        one binary {0,1} channel per class in self.class_names."""
+        path = self.mask_dir / f"{tile_id}.png"
         with rasterio.open(path) as src:
-            mask = src.read()  # (4, H, W), values in {0,1}
-        mask = np.transpose(mask, (1, 2, 0)).astype(np.float32)
-        assert mask.shape[-1] == len(self.class_names), (
-            f"Mask band count {mask.shape[-1]} != expected "
-            f"{len(self.class_names)} classes {self.class_names}. "
-            f"Check addon export format against TASK_09 data contract."
-        )
+            idx = src.read(1)  # (H, W) uint8 class-index map
+        h, w = idx.shape
+        mask = np.zeros((h, w, len(self.class_names)), dtype=np.float32)
+        for c, name in enumerate(self.class_names):
+            mask[..., c] = (idx == ADDON_INDEX[name])
         return mask
 
     def __getitem__(self, idx):

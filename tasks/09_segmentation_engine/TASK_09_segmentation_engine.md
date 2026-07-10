@@ -9,15 +9,23 @@ annotation effort.
 Train a single shared-encoder, multi-label decoder model that predicts four
 independent binary masks per input tile:
 
-| Channel | Class          | Notes                                              |
-|---------|----------------|-----------------------------------------------------|
-| 0       | parcel_border  | interior of manually-adjusted parcel, not cadastral |
-| 1       | building       | building footprint                                  |
-| 2       | hard_surface   | impervious surface + paths ("geçirimsiz arazi")     |
-| 3       | tree           | hard landscape / tree canopy                        |
+| Channel | Class          | Notes                                                    |
+|---------|----------------|-----------------------------------------------------------|
+| 0       | parcel_border  | thin wall/ring outline of the parcel, not the filled interior (addon `parcel_border` polyline) |
+| 1       | building       | building footprint                                        |
+| 2       | hard_surface   | impervious surface + paths, as one class ("geçirimsiz arazi") |
+| 3       | tree           | tree canopy (the addon's `hard_landscape` class)          |
 
-`soft_landscape` is NOT a model output. It is derived at inference:
-`soft = parcel_border AND NOT (building OR hard_surface OR tree)`
+These four are the whole task. Other addon classes (`soft_landscape`,
+`parking_space`, `main_entrance`, `building_entrance`) are deliberately left
+out as future features, not merged into these channels.
+
+`soft_landscape` is NOT a model output. Note that with `parcel_border` now a
+thin ring (not the filled interior), it can no longer be derived as
+`parcel_border AND NOT (building OR hard_surface OR tree)` — recovering the
+soft-landscape area needs the parcel *polygon interior* (from the addon's
+vector layer), which the ring channel does not provide. Deferred, not needed
+for training.
 
 `building_entrance` / `land_entrance` are explicitly out of scope for this task.
 
@@ -57,22 +65,34 @@ first checking a handful of failing validation tiles to confirm the boundary
 is actually visible in the source imagery. If it isn't, log it and move on —
 that's a dataset/scene-selection issue, not a model issue.
 
-## Data contract (assumed — confirm against actual addon export)
+## Data contract (confirmed against the addon export)
 ```
 data/
   images/
-    tile_0001.tif        # 3-band RGB, uint8
+    tile_0001.png         # addon "<stem>_satellite.png" (RGB uint8)
     ...
   masks/
-    tile_0001.tif         # 4-band, uint8, values {0,1}, band order = table above
+    tile_0001.png         # addon "<stem>_mask_index.png"
+                          #   single-channel Grayscale8 class-index map
     ...
   splits/
-    train.txt              # tile ids, one per line
+    train.txt             # tile ids, one per line
     val.txt
 ```
-If the addon exports GeoPackage vector layers instead of pre-rasterized
-masks, `dataset.py::_load_mask()` needs a `rasterize()` step added — the
-rest of the pipeline is unaffected. Flag this to the user before assuming.
+The addon (`zoning_manager/export/rasterize.py`) writes a **multi-class index
+map** — one integer class per pixel, 0 = background — NOT a 4-band multi-label
+stack. Addon index values (`mask_class_index()`):
+`1 soft_landscape · 2 hard_landscape · 3 hard_surface · 4 parking_space ·
+5 building · 6 parcel_border · 7 main_entrance · 8 building_entrance`.
+
+`dataset.py::_load_mask()` expands that index map into the four independent
+binary channels above via `ADDON_INDEX` (parcel_border←6, building←5,
+hard_surface←3, tree←2). Because the four classes barely overlap (a thin ring
+plus three mutually-exclusive fills) the expansion is effectively lossless, so
+Task 09 keeps its multi-label (sigmoid) design unchanged. If overlapping
+targets are ever needed (e.g. re-adding the *filled* parcel interior), the
+addon must emit per-class binary masks before `resolve_overlaps()`; converting
+the argmax index map cannot recover overlaps after the fact.
 
 ## Deliverables for this task
 1. `dataset.py` — PyTorch `Dataset`, tiling/loading, augmentation hooks
