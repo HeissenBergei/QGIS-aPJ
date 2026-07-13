@@ -78,9 +78,18 @@ class ParcelSegDataset(Dataset):
         # OFFLINE when the dataset is built, so they are intentionally NOT
         # repeated here — doing both would just re-shuffle the same 8 finite
         # orientations. Only non-dihedral transforms run online.
+        # Fold-2 additions (FOLD2_DATASET_SPEC "Scale policy"): ±10% scale
+        # jitter for robustness to small GSD deviations, plus photometric
+        # transforms for cross-provider imagery robustness. Masks ride along
+        # with nearest-neighbor resampling (albumentations default).
         return A.Compose([
+            A.Affine(scale=(0.9, 1.1), p=0.5),
             A.ElasticTransform(alpha=30, sigma=5, p=0.2),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.2),
+            A.RandomBrightnessContrast(p=0.3),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20,
+                                 val_shift_limit=10, p=0.3),
+            A.GaussNoise(p=0.2),
         ])
 
     def __len__(self):
