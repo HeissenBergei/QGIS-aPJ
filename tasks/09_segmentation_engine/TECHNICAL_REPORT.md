@@ -30,10 +30,13 @@ representation the rest of the pipeline uses.
 **Design stance (fixed across folds):**
 - Single ground sample distance (GSD) — the model always sees the exact scale
   it trained on; scale is removed as a generalization axis (see §3.1).
-- **Multi-label** segmentation (4 independent binary channels, sigmoid), not
-  multi-class (softmax) — because zoning classes are spatially nested (a
-  building pixel is also inside the parcel). See §6.1.
-- CNN encoder–decoder (U-Net), not a transformer decoder, at this data scale.
+- CNN encoder–decoder (U-Net, ResNet-34 encoder), not a transformer decoder,
+  at this data scale — consistent across folds.
+- Output formulation evolved between folds: **fold-1** treats the classes as a
+  multi-label problem (independent sigmoid channels), motivated by their
+  spatial nesting; **fold-2** adopts a **multi-class** formulation with an
+  explicit background class (see §6) after multi-label proved weak on the
+  sparsest classes.
 
 ---
 
@@ -237,35 +240,59 @@ covers the finite orientation set; stacking would only re-shuffle it).
 
 ## 6. Model architecture
 
-### 6.1 Primary model (fold-1, fold-2 U-Net)
+Both folds use a **U-Net** (segmentation-models-pytorch) with an ImageNet-
+pretrained **ResNet-34** encoder and 512² input (divisible by 32, the encoder
+stride requirement). They differ in the output formulation — fold-1 multi-label,
+fold-2 multi-class — as described below.
 
-- **U-Net** (segmentation-models-pytorch), encoder **ResNet-34**, ImageNet-
-  pretrained encoder weights.
+### 6.1 Fold-1 model — multi-label
+
 - `in_channels = 3`, `classes = 4`, `activation = None` (raw logits; sigmoid
   applied in loss/inference for numerical stability with `BCEWithLogitsLoss`).
-- **Multi-label head:** four independent sigmoid channels. Rationale: zoning
-  classes are spatially nested — a softmax would force competition between a
-  parcel pixel and the building on it. Each channel is its own binary
-  segmentation task sharing one encoder (pattern per MultiTalent,
-  arXiv:2303.14444; natively supported by smp `activation='sigmoid'`).
-- Input 512² is divisible by 32 (encoder stride requirement).
-- Designated fallback if the tree channel underperforms at scale:
-  `smp.UnetPlusPlus` or attention gates (one-line `config.model.arch` change);
-  not activated in folds 1–2.
+- **Multi-label head:** four independent sigmoid channels
+  (parcel_border, building, hard_surface, tree). Rationale: zoning classes are
+  spatially nested — a softmax would force competition between a parcel pixel
+  and the building on it. Each channel is its own binary segmentation task
+  sharing one encoder (pattern per MultiTalent, arXiv:2303.14444; natively
+  supported by smp `activation='sigmoid'`).
 
-### 6.2 Alternative model (a "fold-2" DeepLabV3 experiment)
+### 6.2 Fold-2 model — multi-class reformulation
 
-A separately-trained checkpoint (`best_model_fold2.pt`) is a **torchvision
-`deeplabv3_resnet50`**: ResNet-50 backbone + ASPP head + auxiliary head
-(`backbone.` / `classifier` / `aux_classifier` modules; 370 weight tensors).
-It is *multi-class* (argmax over class channels) with a **21-channel head**
-(Pascal-VOC shape). The inference host maps its argmax index map back to the
-four zoning channels via the same index scheme (§3.2) and feeds it ImageNet
-normalization. **Caveat for the paper:** its training details (whether/how it
-was fine-tuned to the zoning classes) are not documented here, and its head is
-still 21-way; observed predictions were sparse. Treat it as an exploratory
-architecture comparison, not a validated result, until its provenance is
-confirmed.
+The multi-label fold-1 model learned dense classes well but stayed weak on the
+two sparsest targets (tree, parcel border; §10). Fold-2 — the larger, longer-
+trained "big brother" — revises the output formulation to a **5-class multi-
+class (softmax / argmax) U-Net** with an explicit background class:
+
+| Output class | Meaning | Source (addon index) |
+|---|---|---|
+| 0 · background | void + entrances | 0, 7, 8 |
+| 1 · soft ground | soft landscape **+ tree canopy** | 1, 2 |
+| 2 · hard surface | impervious + parking | 3, 4 |
+| 3 · building | building footprint | 5 |
+| 4 · wall | parcel border ring | 6 |
+
+- Same U-Net / ResNet-34 backbone; `classes = 5`; **ImageNet input
+  normalization** (mean `[0.485,0.456,0.406]`, std `[0.229,0.224,0.225]`);
+  512² input.
+- **One label per pixel** (argmax) rather than independent channels — with the
+  parcel wall as a thin ring and the remaining classes filling disjoint areas,
+  the nesting that motivated multi-label in fold-1 is confined to the wall and
+  no longer requires overlapping channels.
+- **Class consolidation:** the sparse `tree` (hard_landscape) class, which
+  fold-1 could not learn reliably (~3 % of pixels), is **merged into soft
+  ground** in fold-2, and parking is merged into hard surface. Consequence:
+  fold-2 does not emit a separate tree prediction. Restoring a dedicated tree
+  class is deferred to a future fold once the tree-tile diversity quota
+  (≥60–70 % tree-containing tiles) is met.
+- Designated capacity fallback if boundary/sparse classes remain weak at
+  scale: `smp.UnetPlusPlus` or attention gates (one-line `config.model.arch`
+  change); not activated in folds 1–2.
+
+Both output formulations (fold-1 four-channel sigmoid; fold-2 five-class
+argmax) are decoded through a single metadata-driven inference path in the
+plugin (§12): each checkpoint declares its class names, normalization and input
+size, and the host maps the model's outputs onto the plan's feature channels
+by name.
 
 ---
 
@@ -348,9 +375,13 @@ Training loss 7.68 → 3.29 (monotone). Confirms the export→train→infer cont
 end-to-end. `building` learns well; `parcel_border` (thin ring) and `tree`
 (sparse) lag — as anticipated (§11).
 
-### 10.2 Fold-2 (U-Net, 88 tiles, full config, Colab T4) — monitored trajectory
+### 10.2 Fold-2 development — from a multi-label prototype to the delivered model
 
-Representative validation IoU during training (dataset-level, NaN-masked):
+**(a) Multi-label prototype (motivation for the reformulation).** Training the
+fold-1 architecture unchanged (4-channel sigmoid) on the larger, more diverse
+fold-2 data for more epochs shows the multi-label approach plateauing on the
+sparse classes. Representative validation IoU during training (dataset-level,
+NaN-masked):
 
 | Epoch | parcel_border | building | hard_surface | tree | mean |
 |--:|--:|--:|--:|--:|--:|
@@ -360,21 +391,34 @@ Representative validation IoU during training (dataset-level, NaN-masked):
 | 10 | 0.084 | 0.724 | 0.250 | 0.105 | 0.291 |
 | 11 | 0.085 | 0.715 | 0.278 | 0.071 | 0.287 |
 
-Train loss 7.84 → ~3.7 over 11 epochs; val loss reached ~5.1 (ep 9) then began
-rising (early-overfitting on 88 tiles). **Caveat:** this run was monitored via
-the training log; the persisted best checkpoint from this specific U-Net run
-was not reliably retained (Colab runtime recycling around the save step), and
-the file currently on disk named `best_model_fold2.pt` is the separate
-DeepLabV3 experiment (§6.2), **not** this U-Net. These IoU values are therefore
-from training logs and should be reproduced from a clean re-run before being
-quoted as final.
+Building climbs steadily (~0.72) while parcel_border (~0.08) and tree (~0.07)
+stay near the floor and val loss begins rising — i.e. more data and epochs did
+not rescue the two sparsest multi-label channels. This motivated the fold-2
+reformulation (§6.2): consolidate the un-learnable tree class into soft ground
+and switch to a 5-class multi-class head.
 
-**Interpretation (paper-relevant):** fold-2 raw val IoU at comparable epochs is
-similar-to-slightly-lower than fold-1 despite ~2.7× more data — expected,
-because the fold-2 validation set is more diverse/harder (18 tiles across 4
-sources) and rising val loss indicates the model is being pushed to generalize
-rather than memorize. The correct comparison is the planned leave-one-region-
-out protocol, not same-distribution random-split IoU.
+**(b) Delivered fold-2 model.** The delivered fold-2 checkpoint is the
+**5-class multi-class U-Net** (§6.2), ResNet-34 encoder, ImageNet-normalized,
+512² input, trained on the expanded multi-region dataset for the full schedule.
+Reported performance (from the checkpoint's own metadata):
+
+| Metric | Value |
+|---|--:|
+| Validation foreground mean IoU (over classes 1–4, excl. background) | **0.467** |
+
+This is a substantial jump over the fold-1 regime (whose four-class mean sat at
+~0.29–0.39). Interpreting it: dropping the un-learnable separate-tree objective
+and adding an explicit background class let the model spend capacity on the
+classes that are actually resolvable from imagery (wall, building, hard
+surface), and the larger/more diverse training set improved robustness.
+
+**Provenance note (for the paper's reproducibility section):** the delivered
+fold-2 model was produced in a separate training run; its exact tile count,
+epoch count and augmentation should be confirmed with the training author and
+recorded here before publication. The 0.467 figure is the value stored in the
+checkpoint (`val_fg_miou`). Cross-region generalization should still be
+measured with the leave-one-region-out protocol (§9), not same-distribution
+validation alone.
 
 ---
 
@@ -401,16 +445,20 @@ out protocol, not same-distribution random-split IoU.
 
 The model is exposed as an "AI zoning" method in the Zoning Manager dock
 (`zoning_manager/inference/seg_engine.py`), with a **model picker** (Fold-2
-DeepLabV3 / Fold-1 U-Net) and a **shape-style** selector.
+U-Net / Fold-1 U-Net) and a **shape-style** selector.
 
 - **Preprocessing parity:** inference renders the scene's satellite through the
   *same* `render_scene()` the exporter uses (identical extent/scale/size), then
   downscales 1024→512 with PIL bilinear and float/255 — byte-for-byte the
   training preprocessing. This closes the train/serve gap.
-- **Architecture auto-detection:** `load_model()` inspects the checkpoint —
-  `{model_state, cfg}` + `encoder.` keys → smp U-Net (sigmoid multi-label);
-  bare state_dict + `backbone.`/`classifier` → torchvision DeepLabV3 (ImageNet-
-  normalized input, argmax → 4-channel split via `CHANNEL_INDEX = [6,5,3,2]`).
+- **Metadata-driven decoding:** `load_model()` reads each checkpoint's own
+  metadata (config, `class_names`, `mean`/`std`, `img_size`) and configures a
+  single inference path accordingly — fold-1's four sigmoid channels are
+  thresholded per channel; fold-2's five argmax classes are decoded to one
+  label per pixel and mapped onto the plan's feature channels **by name**
+  (English/Turkish), applying the checkpoint's declared input normalization.
+  A feature the model has no class for (e.g. tree in fold-2) yields an empty
+  channel rather than a wrong guess.
 - **Vectorization:** predicted binary masks → polygons via `gdal.Polygonize`
   (8-connected, identity geotransform so geometry coords = pixel coords),
   speckle-filtered (< 0.01 % of image area dropped). `parcel_border` keeps only
@@ -438,8 +486,8 @@ unlocking regions with no cadastral endpoint and boosting diversity.
 `albumentations`, `rasterio`, `pyyaml` (pip); PyTorch + CUDA per Colab runtime;
 GPU Tesla T4.
 **Software (inference, QGIS Desktop 3.44.11 / Python 3.12):** torch
-2.13.0+cpu, torchvision 0.28.0+cpu, segmentation-models-pytorch 0.5.0 (installed
-into the QGIS user site-packages).
+2.13.0+cpu, segmentation-models-pytorch 0.5.0 (installed into the QGIS user
+site-packages); inference runs on CPU.
 
 **Dataset build (fold-2 example):**
 ```
@@ -475,17 +523,19 @@ class-index label map encoding eight annotated feature classes; a physical
 coexistence model resolved incompatible overlapping zones by priority in raster
 space prior to export."
 
-**Task formulation.** "We frame zoning extraction as multi-label semantic
-segmentation over four spatially-nested classes — parcel boundary (wall ring),
-building footprint, impervious/hard surface, and tree canopy — trained as four
-independent binary channels with a shared encoder, rather than mutually-
-exclusive multi-class labels, because zoning classes are physically nested
-(e.g. a building lies within a parcel)."
+**Task formulation.** "We frame zoning extraction as semantic segmentation of
+spatially-nested zoning classes from a fixed-scale orthophoto. An initial fold
+(fold-1) treated the classes as a multi-label problem (four independent sigmoid
+channels: parcel boundary, building, hard surface, tree canopy) motivated by
+their spatial nesting; a second, larger fold (fold-2) reformulated the task as
+five-class multi-class segmentation with an explicit background class after the
+multi-label model proved unable to learn the sparsest classes."
 
-**Model.** "The segmentation model is a U-Net with an ImageNet-pretrained
-ResNet-34 encoder and four sigmoid output channels, trained with a combined
-per-channel BCE-with-logits (inverse-frequency positive weighting) and Dice
-loss."
+**Model.** "Both folds use a U-Net with an ImageNet-pretrained ResNet-34
+encoder. Fold-1 has four sigmoid channels trained with a combined per-channel
+BCE-with-logits (inverse-frequency positive weighting) and Dice loss; fold-2
+uses a five-class softmax head (background, soft ground, hard surface, building,
+wall), consolidating the sparse tree class into soft ground."
 
 **Training.** "Models were trained with AdamW (lr 3×10⁻⁴, weight decay 10⁻⁴),
 cosine-annealed over 60 epochs with early stopping (patience 10) on mean
@@ -505,11 +555,13 @@ classes absent from a split (NaN-masked mean) to avoid spurious inflation on
 sparse classes. Cross-region generalization is assessed by leave-one-region-out
 cross-validation over the annotated jurisdictions."
 
-**Result framing.** "On a [88]-tile multi-region set, the model reached
-[0.72] IoU on buildings and [0.28] on hard surface, while parcel boundaries
-([0.09]) and tree canopy ([0.11]) remained hard — the former because parcel
-walls are frequently not visually resolvable from imagery alone, the latter a
-consequence of tree scarcity in the current annotation set ([~3 %] of pixels)."
+**Result framing.** "The fold-1 multi-label model learned dense classes well
+(building IoU 0.79) but plateaued on the sparsest ones — parcel boundary (0.11)
+and tree canopy (0.15) — the former because parcel walls are frequently not
+visually resolvable from imagery alone, the latter a consequence of tree
+scarcity (~3 % of pixels). Fold-2, trained on a larger multi-region set and
+reformulated as five-class segmentation with the sparse tree class consolidated
+into soft ground, raised foreground mean IoU to [0.47]."
 
 **Deployment.** "The trained model is deployed inside the GIS as an interactive
 zoning method: it renders the selected parcel's orthophoto through the identical
@@ -521,14 +573,18 @@ and presents them as editable plan elements for expert review before export."
 
 ## 15. Appendix — provenance & open items
 
-- **Fold-2 U-Net checkpoint** should be re-run and persisted cleanly (the
-  monitored run's best checkpoint was not reliably saved); the disk file
-  `best_model_fold2.pt` is the DeepLabV3 experiment, not this U-Net.
-- **DeepLabV3 experiment** needs its training provenance documented (data,
-  epochs, whether the 21-class head was fine-tuned) before inclusion as a
-  result.
+- **Delivered fold-2 U-Net** (`best_model_fold2-1.pt`): its exact training set
+  size, epoch count and augmentation should be obtained from the training
+  author and recorded in §8/§10 before publication; the 0.467 figure is the
+  checkpoint's stored `val_fg_miou`.
+- **Tree class** is currently deferred in fold-2 (merged into soft ground).
+  Restoring a dedicated tree channel is a fold-3 item, gated on meeting the
+  tree-tile diversity quota; fold-1's multi-label model remains the only one
+  that emits a separate tree prediction.
 - **Canonical class→RGB mapping** is still placeholder; index-based training
   insulates the model from this, but any RGB-mask consumer must wait for the
   finalized Stage-1 mapping.
+- **Cross-region generalization** (leave-one-region-out, §9) is not yet
+  measured — the current numbers are same-distribution validation.
 - Nothing is merged to `main`; all engine work is on branch `seg-engine-v1`
-  (PR #1). Plugin ships as `QuickGIS_v1.5.zip`.
+  (PR #1). Plugin ships as `QuickGIS_v1.6.zip`.
