@@ -1,0 +1,54 @@
+seed: 42
+
+data:
+  root: "data"
+  image_dir: "images"
+  mask_dir: "masks"
+  train_split: "splits/train.txt"
+  val_split: "splits/val.txt"
+  tile_size: 512
+  num_classes: 4
+  class_names: ["parcel_border", "building", "hard_surface", "tree"]
+
+model:
+  arch: "Unet"          # smp.Unet | smp.UnetPlusPlus (fallback for tree channel)
+  encoder: "resnet34"
+  encoder_weights: "imagenet"
+  in_channels: 3
+  classes: 4
+
+loss:
+  bce_weight: 1.0
+  dice_weight: 1.0
+  # inverse-frequency pos_weight per channel for BCE (neg/pos), computed from
+  # the 70 train base tiles of the fold-2 set (7 sources, 88 tiles, 512px):
+  #   parcel_border 1.97% px -> 49.747   building     10.82% px -> 8.244
+  #   hard_surface  6.25% px -> 14.99    tree          2.97% px -> 32.673
+  # Recompute if the dataset changes (prepare_dataset.py prints it).
+  pos_weight: [49.747, 8.244, 14.99, 32.673]
+
+train:
+  batch_size: 8
+  epochs: 60
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  optimizer: "adamw"
+  scheduler: "cosine"
+  early_stopping_patience: 10
+  num_workers: 2
+  device: "cuda"
+
+augmentation:
+  # Dihedral-8 (flips + 90° rotations) is applied OFFLINE when building the
+  # dataset (each train tile is materialized in all 8 orientations), so the
+  # online geometric transforms below are disabled to avoid stacking. Only
+  # the non-dihedral photometric/elastic transforms run online.
+  hflip: 0.0
+  vflip: 0.0
+  rotate90: false
+  elastic_deform: 0.2      # apply to image+mask jointly
+  color_jitter: 0.2
+
+checkpoint:
+  dir: "checkpoints"
+  save_best_metric: "mean_iou"

@@ -1,0 +1,11 @@
+# Training data & artifacts live outside git (large PNGs; use Drive/Colab).
+data/
+fold1_dataset/
+checkpoints/
+*.ckpt
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+config_trial.yaml
