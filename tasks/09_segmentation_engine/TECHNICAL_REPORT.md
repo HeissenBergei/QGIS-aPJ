@@ -240,10 +240,11 @@ covers the finite orientation set; stacking would only re-shuffle it).
 
 ## 6. Model architecture
 
-Both folds use a **U-Net** (segmentation-models-pytorch) with an ImageNet-
-pretrained **ResNet-34** encoder and 512² input (divisible by 32, the encoder
-stride requirement). They differ in the output formulation — fold-1 multi-label,
-fold-2 multi-class — as described below.
+Both folds are encoder–decoder segmentation CNNs built with
+segmentation-models-pytorch on 512² input, but the folds differ in backbone,
+decoder and output formulation. Fold-1 is a **U-Net / ResNet-34** with a
+multi-label head; the delivered fold-2 is a **UNet++ / EfficientNet-B3** with a
+multi-class head (see §6.2).
 
 ### 6.1 Fold-1 model — multi-label
 
@@ -256,43 +257,49 @@ fold-2 multi-class — as described below.
   sharing one encoder (pattern per MultiTalent, arXiv:2303.14444; natively
   supported by smp `activation='sigmoid'`).
 
-### 6.2 Fold-2 model — multi-class reformulation
+### 6.2 Fold-2 model — UNet++ / EfficientNet-B3, multi-class
 
 The multi-label fold-1 model learned dense classes well but stayed weak on the
-two sparsest targets (tree, parcel border; §10). Fold-2 — the larger, longer-
-trained "big brother" — revises the output formulation to a **5-class multi-
-class (softmax / argmax) U-Net** with an explicit background class:
+two sparsest targets (tree, parcel border; §10). Fold-2 — the larger,
+longer-trained "big brother" — changes three things at once: a stronger
+backbone/decoder, a bigger/more diverse training set, and a **5-class
+multi-class (softmax / argmax)** output with an explicit background class:
 
 | Output class | Meaning | Source (addon index) |
 |---|---|---|
-| 0 · background | void + entrances | 0, 7, 8 |
-| 1 · soft ground | soft landscape **+ tree canopy** | 1, 2 |
-| 2 · hard surface | impervious + parking | 3, 4 |
-| 3 · building | building footprint | 5 |
-| 4 · wall | parcel border ring | 6 |
+| 0 · background (`arka_plan`) | void + entrances | 0, 7, 8 |
+| 1 · soft ground (`yumusak_zemin`) | soft landscape **+ tree canopy** | 1, 2 |
+| 2 · hard surface (`sert_zemin`) | impervious + parking | 3, 4 |
+| 3 · building (`bina`) | building footprint | 5 |
+| 4 · wall (`duvar`) | parcel border ring | 6 |
 
-- Same U-Net / ResNet-34 backbone; `classes = 5`; **ImageNet input
-  normalization** (mean `[0.485,0.456,0.406]`, std `[0.229,0.224,0.225]`);
-  512² input.
+- **Architecture:** `smp.UnetPlusPlus`, encoder **EfficientNet-B3**
+  (ImageNet-pretrained); `classes = 5`; **ImageNet input normalization**
+  (mean `[0.485,0.456,0.406]`, std `[0.229,0.224,0.225]`); 512² input. UNet++'s
+  nested dense skip connections and the EfficientNet-B3 backbone give more
+  capacity/finer boundaries than fold-1's ResNet-34 U-Net — this was the
+  designated capacity upgrade flagged in TASK_09, now activated.
 - **One label per pixel** (argmax) rather than independent channels — with the
   parcel wall as a thin ring and the remaining classes filling disjoint areas,
   the nesting that motivated multi-label in fold-1 is confined to the wall and
   no longer requires overlapping channels.
 - **Class consolidation:** the sparse `tree` (hard_landscape) class, which
   fold-1 could not learn reliably (~3 % of pixels), is **merged into soft
-  ground** in fold-2, and parking is merged into hard surface. Consequence:
-  fold-2 does not emit a separate tree prediction. Restoring a dedicated tree
-  class is deferred to a future fold once the tree-tile diversity quota
-  (≥60–70 % tree-containing tiles) is met.
-- Designated capacity fallback if boundary/sparse classes remain weak at
-  scale: `smp.UnetPlusPlus` or attention gates (one-line `config.model.arch`
-  change); not activated in folds 1–2.
+  ground**, and parking is merged into hard surface. Consequence: fold-2 does
+  not emit a separate tree prediction. Restoring a dedicated tree class is
+  deferred to a future fold once the tree-tile diversity quota (≥60–70 %
+  tree-containing tiles) is met.
+- **Sparse-class training aids** (from the checkpoint's `train_cfg`): the wall
+  class gets a loss up-weight (`duvar_boost = 1.6`) and its thin label is
+  dilated by 1 px (`wall_dilate = 1`) so the boundary is learnable; a 3-term
+  loss with weights `[0.35, 0.35, 0.30]` is used; validation is scored with
+  test-time augmentation (`tta_val = True`).
 
 Both output formulations (fold-1 four-channel sigmoid; fold-2 five-class
 argmax) are decoded through a single metadata-driven inference path in the
-plugin (§12): each checkpoint declares its class names, normalization and input
-size, and the host maps the model's outputs onto the plan's feature channels
-by name.
+plugin (§12): each checkpoint declares its architecture, class names,
+normalization and input size, and the host maps the model's outputs onto the
+plan's feature channels by name.
 
 ---
 
@@ -398,34 +405,47 @@ reformulation (§6.2): consolidate the un-learnable tree class into soft ground
 and switch to a 5-class multi-class head.
 
 **(b) Delivered fold-2 model.** The delivered fold-2 checkpoint is the
-**5-class multi-class U-Net** (§6.2), ResNet-34 encoder, ImageNet-normalized,
-512² input, trained on the expanded multi-region dataset for the full schedule.
-Reported performance (from the checkpoint's own metadata):
+**5-class UNet++ / EfficientNet-B3** model (§6.2), ImageNet-normalized, 512²
+input, trained on the expanded multi-region dataset. Per-class validation IoU
+(from the checkpoint's own metadata, scored with test-time augmentation):
 
-| Metric | Value |
+| Class | val IoU |
 |---|--:|
-| Validation foreground mean IoU (over classes 1–4, excl. background) | **0.467** |
+| background (`arka_plan`) | 0.910 |
+| soft ground (`yumusak_zemin`) — incl. trees | 0.629 |
+| building (`bina`) | **0.790** |
+| hard surface (`sert_zemin`) | 0.346 |
+| wall / parcel border (`duvar`) | 0.189 |
+| **Foreground mean IoU** (classes 1–4, excl. background) | **0.488** |
 
 This is a substantial jump over the fold-1 regime (whose four-class mean sat at
-~0.29–0.39). Interpreting it: dropping the un-learnable separate-tree objective
-and adding an explicit background class let the model spend capacity on the
-classes that are actually resolvable from imagery (wall, building, hard
-surface), and the larger/more diverse training set improved robustness.
+~0.29–0.39). Interpreting it: the stronger UNet++/EfficientNet-B3 backbone plus
+dropping the un-learnable separate-tree objective and adding an explicit
+background class let the model spend capacity on the classes actually
+resolvable from imagery. Building is strong (0.79) and soft ground good (0.63);
+**wall (0.189) remains the hardest** even with the loss up-weight and label
+dilation — the validation confusion matrix shows the wall is *over-predicted*
+(low precision), consistent with a thin, dilated boundary class. Hard surface
+(0.346) sits mid-range.
 
 **Provenance note (for the paper's reproducibility section):** the delivered
 fold-2 model was produced in a separate training run; its exact tile count,
-epoch count and augmentation should be confirmed with the training author and
-recorded here before publication. The 0.467 figure is the value stored in the
-checkpoint (`val_fg_miou`). Cross-region generalization should still be
-measured with the leave-one-region-out protocol (§9), not same-distribution
-validation alone.
+epoch count, optimizer/LR and augmentation should be confirmed with the
+training author and recorded in §8 before publication (the checkpoint's
+`train_cfg` records only the sparse-class aids, §6.2). The IoU figures are the
+values stored in the checkpoint (`val_class_iou` / `val_fg_miou`) and are
+computed *with test-time augmentation*, so single-pass in-plugin inference will
+score marginally lower. Cross-region generalization should still be measured
+with the leave-one-region-out protocol (§9), not same-distribution validation
+alone.
 
 ---
 
 ## 11. Known limitations & failure modes
 
-- **`parcel_border` (IoU ~0.08–0.11):** parcel boundaries are frequently not
-  visually distinguishable from imagery (Crommelinck et al. 2019,
+- **`parcel_border` / wall (IoU ~0.08–0.19 across folds):** parcel boundaries
+  are frequently not visually distinguishable from imagery (Crommelinck et al.
+  2019,
   10.3390/rs11212505). Treated as a data/scene-selection issue, not a model
   bug; verify the boundary is actually visible before tuning.
 - **`tree` (IoU ~0.10–0.15):** a direct data artifact — sparse positive pixels
@@ -531,11 +551,13 @@ their spatial nesting; a second, larger fold (fold-2) reformulated the task as
 five-class multi-class segmentation with an explicit background class after the
 multi-label model proved unable to learn the sparsest classes."
 
-**Model.** "Both folds use a U-Net with an ImageNet-pretrained ResNet-34
-encoder. Fold-1 has four sigmoid channels trained with a combined per-channel
-BCE-with-logits (inverse-frequency positive weighting) and Dice loss; fold-2
-uses a five-class softmax head (background, soft ground, hard surface, building,
-wall), consolidating the sparse tree class into soft ground."
+**Model.** "Fold-1 is a U-Net with an ImageNet-pretrained ResNet-34 encoder and
+four sigmoid channels, trained with a combined per-channel BCE-with-logits
+(inverse-frequency positive weighting) and Dice loss. Fold-2 upgrades to a
+UNet++ decoder with an EfficientNet-B3 encoder and a five-class softmax head
+(background, soft ground, hard surface, building, wall), consolidating the
+sparse tree class into soft ground; the boundary (wall) class is trained with a
+loss up-weight and 1-pixel label dilation."
 
 **Training.** "Models were trained with AdamW (lr 3×10⁻⁴, weight decay 10⁻⁴),
 cosine-annealed over 60 epochs with early stopping (patience 10) on mean
@@ -559,9 +581,11 @@ cross-validation over the annotated jurisdictions."
 (building IoU 0.79) but plateaued on the sparsest ones — parcel boundary (0.11)
 and tree canopy (0.15) — the former because parcel walls are frequently not
 visually resolvable from imagery alone, the latter a consequence of tree
-scarcity (~3 % of pixels). Fold-2, trained on a larger multi-region set and
-reformulated as five-class segmentation with the sparse tree class consolidated
-into soft ground, raised foreground mean IoU to [0.47]."
+scarcity (~3 % of pixels). Fold-2 — a UNet++/EfficientNet-B3 model trained on a
+larger multi-region set and reformulated as five-class segmentation with the
+sparse tree class consolidated into soft ground — raised foreground mean IoU to
+0.49 (building 0.79, soft ground 0.63, hard surface 0.35), though the parcel
+wall (0.19) remained the hardest class."
 
 **Deployment.** "The trained model is deployed inside the GIS as an interactive
 zoning method: it renders the selected parcel's orthophoto through the identical
@@ -573,10 +597,14 @@ and presents them as editable plan elements for expert review before export."
 
 ## 15. Appendix — provenance & open items
 
-- **Delivered fold-2 U-Net** (`best_model_fold2-1.pt`): its exact training set
-  size, epoch count and augmentation should be obtained from the training
-  author and recorded in §8/§10 before publication; the 0.467 figure is the
-  checkpoint's stored `val_fg_miou`.
+- **Delivered fold-2 model** (`best_model_fold_v2.pt`, UNet++/EfficientNet-B3,
+  ~53 MB): its exact training-set size, epoch count, optimizer/LR and
+  augmentation should be obtained from the training author and recorded in
+  §8/§10 before publication; the IoU figures are the checkpoint's stored
+  `val_class_iou` / `val_fg_miou` (0.488), computed with test-time
+  augmentation. (An earlier fold-2 attempt — a 5-class ResNet-34 U-Net,
+  `best_model_fold2-1.pt`, foreground mIoU 0.467 — was superseded by this
+  stronger backbone.)
 - **Tree class** is currently deferred in fold-2 (merged into soft ground).
   Restoring a dedicated tree channel is a fold-3 item, gated on meeting the
   tree-tile diversity quota; fold-1's multi-label model remains the only one
